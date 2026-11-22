@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint, types, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+        env:
+          # Placeholders: the build doesn't call Supabase.
+          NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:55321
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: build-placeholder
+
+  e2e:
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.109.0
+
+      # Database, auth, API gateway, REST and Mailpit (sign-in emails) only.
+      - name: Start local Supabase (applies migrations + demo seed)
+        run: supabase start -x analytics,edge-runtime,functions,imgproxy,meta,realtime,storage,studio,vector
+
+      - name: Use the local Supabase keys
+        run: |
+          supabase status -o json > "$RUNNER_TEMP/supabase.json"
+          {
+            echo "NEXT_PUBLIC_SUPABASE_URL=$(jq -r .API_URL "$RUNNER_TEMP/supabase.json")"
+            echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=$(jq -r .ANON_KEY "$RUNNER_TEMP/supabase.json")"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$(jq -r .SERVICE_ROLE_KEY "$RUNNER_TEMP/supabase.json")"
+            echo "MAILPIT_URL=$(jq -r .MAILPIT_URL "$RUNNER_TEMP/supabase.json")"
+          } >> "$GITHUB_ENV"
+
+      - run: npm run build
+
+      - name: Start the app
+        run: |
+          npm run start -- -p 3000 > "$RUNNER_TEMP/app.log" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null http://localhost:3000/login && exit 0
+            sleep 1
+          done
+          echo "App didn't start"; cat "$RUNNER_TEMP/app.log"; exit 1
+
+      # The UI suite drives the runner's preinstalled Google Chrome.
+      - name: Run tests
+        run: npm run test:e2e
+        env:
+          APP_URL: http://localhost:3000
+          SCREENSHOTS: ${{ runner.temp }}/screenshots
+
+      - name: Upload app log and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-debug
+          path: |
+            ${{ runner.temp }}/app.log
+            ${{ runner.temp }}/screenshots
+          if-no-files-found: ignore
